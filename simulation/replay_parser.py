@@ -107,7 +107,7 @@ class ReplayParser:
     def _shape_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
         """Shape event for frontend/display."""
         action = event.get("action")
-        return {
+        shaped = {
             "timestamp": event.get("timestamp"),
             "tick": event.get("tick"),
             "agent": event.get("agent"),
@@ -123,6 +123,10 @@ class ReplayParser:
             "executed_action": event.get("executed_action") or action,
             "normalization_notes": event.get("normalization_notes") or [],
         }
+        llm_diag = event.get("llm_decide_diagnostics")
+        if llm_diag is not None:
+            shaped["llm_decide_diagnostics"] = llm_diag
+        return shaped
 
     def _build_metadata(self, replay_id: str, events: List[Dict]) -> ReplayMetadata:
         """Build metadata for the replay."""

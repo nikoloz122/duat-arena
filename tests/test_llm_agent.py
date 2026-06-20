@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -68,6 +69,15 @@ def _run(agent, *, ticks=6, log_dir=None):
         max_ticks=ticks,
         recorder=ReplayRecorder(log_dir=log_dir),
     ).run()
+
+
+def _replay_body_without_llm_diagnostics(body: str) -> str:
+    lines = []
+    for line in body.strip().splitlines():
+        event = json.loads(line)
+        event.pop("llm_decide_diagnostics", None)
+        lines.append(json.dumps(event, ensure_ascii=False))
+    return "\n".join(lines) + "\n"
 
 
 class LlmAgentDecisionTests(unittest.TestCase):
@@ -207,7 +217,10 @@ class LlmAgentCacheTests(unittest.TestCase):
             )
 
         self.assertEqual(calls["n"], calls_after_record)  # no new calls
-        self.assertEqual(body1, body2)  # identical replay bodies
+        self.assertEqual(
+            _replay_body_without_llm_diagnostics(body1),
+            _replay_body_without_llm_diagnostics(body2),
+        )
 
     def test_replay_mode_never_calls_api(self) -> None:
         with tempfile.TemporaryDirectory() as log_dir:
@@ -235,6 +248,50 @@ class LlmAgentDegradationTests(unittest.TestCase):
 
         self.assertEqual(result.ticks, 6)
         self.assertTrue(all(e["executed_action"] == "hold" for e in replay["events"]))
+
+
+class LlmTick0DiagnosticsTests(unittest.TestCase):
+    def test_tick0_replay_and_result_include_llm_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir:
+            agent = build_llm_agent(client=_valid_buy_client, cache_path=_cache_file(log_dir))
+            result = _run(agent, ticks=3, log_dir=log_dir)
+            replay = load_replay(result.replay_id, log_dir=log_dir)
+
+        tick0_events = [
+            e for e in replay["events"] if e["tick"] == 0 and e["agent"] == LLM_AGENT_ID
+        ]
+        self.assertEqual(len(tick0_events), 1)
+        diag = tick0_events[0]["llm_decide_diagnostics"]
+        self.assertIsNotNone(diag)
+        self.assertEqual(
+            diag["raw_decision"],
+            {"action": "buy", "size": 1.0, "reason": "momentum", "confidence": 0.7},
+        )
+        self.assertEqual(diag["normalization_notes"], [])
+        self.assertFalse(diag["cache_hit"])
+        self.assertTrue(diag["cache_miss"])
+        self.assertFalse(diag["anthropic_api_called"])
+        self.assertTrue(diag["parser_succeeded"])
+        self.assertNotIn("exception_message", diag)
+
+        result_diag = result.to_dict().get("llm_tick0_diagnostics")
+        self.assertEqual(result_diag, diag)
+
+    def test_tick0_diagnostics_capture_no_decision_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir:
+            agent = build_llm_agent(client=_malformed_client, cache_path=_cache_file(log_dir))
+            result = _run(agent, ticks=2, log_dir=log_dir)
+            replay = load_replay(result.replay_id, log_dir=log_dir)
+
+        diag = next(
+            e["llm_decide_diagnostics"]
+            for e in replay["events"]
+            if e["tick"] == 0 and e["agent"] == LLM_AGENT_ID
+        )
+        self.assertIsNone(diag["raw_decision"])
+        self.assertFalse(diag["parser_succeeded"])
+        self.assertIn("agent returned no decision", diag["normalization_notes"][0])
+        self.assertEqual(diag["exception_message"], "parser_failure")
 
 
 class LlmAgentRegistryApiTests(unittest.TestCase):

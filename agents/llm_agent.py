@@ -296,6 +296,24 @@ def build_llm_agent(
     model = model or os.getenv("DUAT_LLM_MODEL") or DEFAULT_MODEL
     mode = (mode or os.getenv("DUAT_LLM_MODE") or MODE_AUTO).lower()
     cache = ResponseCache(cache_path or os.getenv("DUAT_LLM_CACHE") or DEFAULT_CACHE_PATH)
+    last_trace: dict[str, Any] = {}
+
+    def _record_trace(
+        tick: int,
+        *,
+        cache_hit: bool,
+        anthropic_api_called: bool,
+        parser_succeeded: bool,
+        internal_failure: Optional[str] = None,
+    ) -> None:
+        last_trace.clear()
+        last_trace["tick"] = tick
+        last_trace["cache_hit"] = cache_hit
+        last_trace["cache_miss"] = not cache_hit
+        last_trace["anthropic_api_called"] = anthropic_api_called
+        last_trace["parser_succeeded"] = parser_succeeded
+        if internal_failure:
+            last_trace["internal_failure"] = internal_failure
 
     def _log_no_decision(reason_code: str, tick: int, *, cache_key: str, **details: Any) -> None:
         detail_parts = " ".join(f"{key}={value!r}" for key, value in details.items())
@@ -322,10 +340,24 @@ def build_llm_agent(
                     cache_key=key,
                     raw_response=_preview(cached),
                 )
+            _record_trace(
+                tick,
+                cache_hit=True,
+                anthropic_api_called=False,
+                parser_succeeded=parsed is not None,
+                internal_failure="cache_parser_failure" if parsed is None else None,
+            )
             return parsed
 
         if mode == MODE_REPLAY:
             _log_no_decision("replay_cache_miss", tick, cache_key=key, mode=mode)
+            _record_trace(
+                tick,
+                cache_hit=False,
+                anthropic_api_called=False,
+                parser_succeeded=False,
+                internal_failure="replay_cache_miss",
+            )
             return None
 
         system = SYSTEM_PROMPT
@@ -347,6 +379,13 @@ def build_llm_agent(
                 api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
                 if not api_key:
                     _log_no_decision("missing_api_key", tick, cache_key=key, mode=mode)
+                    _record_trace(
+                        tick,
+                        cache_hit=False,
+                        anthropic_api_called=False,
+                        parser_succeeded=False,
+                        internal_failure="missing_api_key",
+                    )
                     return None
                 logger.info(
                     "llm API request started agent=%s tick=%d model=%s cache_key=%s "
@@ -368,6 +407,13 @@ def build_llm_agent(
                 reason=exc.reason,
                 error_body=_preview(error_body),
             )
+            _record_trace(
+                tick,
+                cache_hit=False,
+                anthropic_api_called=client is None,
+                parser_succeeded=False,
+                internal_failure=f"http_error: status={exc.code} reason={exc.reason} body={_preview(error_body)}",
+            )
             return None
         except (TimeoutError, socket.timeout) as exc:
             _log_no_decision(
@@ -377,6 +423,13 @@ def build_llm_agent(
                 timeout_seconds=timeout,
                 error=f"{type(exc).__name__}: {exc}",
             )
+            _record_trace(
+                tick,
+                cache_hit=False,
+                anthropic_api_called=client is None,
+                parser_succeeded=False,
+                internal_failure=f"timeout_error: {type(exc).__name__}: {exc}",
+            )
             return None
         except urllib.error.URLError as exc:
             _log_no_decision(
@@ -384,6 +437,13 @@ def build_llm_agent(
                 tick,
                 cache_key=key,
                 error=f"{type(exc).__name__}: {exc.reason}",
+            )
+            _record_trace(
+                tick,
+                cache_hit=False,
+                anthropic_api_called=client is None,
+                parser_succeeded=False,
+                internal_failure=f"network_error: {type(exc).__name__}: {exc.reason}",
             )
             return None
         except json.JSONDecodeError as exc:
@@ -393,6 +453,13 @@ def build_llm_agent(
                 cache_key=key,
                 error=f"{type(exc).__name__}: {exc}",
             )
+            _record_trace(
+                tick,
+                cache_hit=False,
+                anthropic_api_called=client is None,
+                parser_succeeded=False,
+                internal_failure=f"api_response_json_decode_error: {type(exc).__name__}: {exc}",
+            )
             return None
         except Exception as exc:  # noqa: BLE001 - any client/transport failure -> safe hold
             _log_no_decision(
@@ -400,6 +467,13 @@ def build_llm_agent(
                 tick,
                 cache_key=key,
                 error=f"{type(exc).__name__}: {exc}",
+            )
+            _record_trace(
+                tick,
+                cache_hit=False,
+                anthropic_api_called=client is None,
+                parser_succeeded=False,
+                internal_failure=f"unexpected_error: {type(exc).__name__}: {exc}",
             )
             return None
 
@@ -414,9 +488,23 @@ def build_llm_agent(
 
         if text is None:
             _log_no_decision("empty_response", tick, cache_key=key, raw_response="<none>")
+            _record_trace(
+                tick,
+                cache_hit=False,
+                anthropic_api_called=client is None,
+                parser_succeeded=False,
+                internal_failure="empty_response",
+            )
             return None
         if text == "":
             _log_no_decision("empty_response", tick, cache_key=key, raw_response="<empty>")
+            _record_trace(
+                tick,
+                cache_hit=False,
+                anthropic_api_called=client is None,
+                parser_succeeded=False,
+                internal_failure="empty_response",
+            )
             return None
 
         cache.put(key, text)
@@ -428,6 +516,15 @@ def build_llm_agent(
                 cache_key=key,
                 raw_response=_preview(text),
             )
+        _record_trace(
+            tick,
+            cache_hit=False,
+            anthropic_api_called=client is None,
+            parser_succeeded=parsed is not None,
+            internal_failure="parser_failure" if parsed is None else None,
+        )
         return parsed
 
-    return CallableAgentAdapter(agent_id, decide, name=name, risk_profile="llm")
+    adapter = CallableAgentAdapter(agent_id, decide, name=name, risk_profile="llm")
+    adapter.llm_decide_diagnostics = last_trace
+    return adapter

@@ -40,6 +40,11 @@ class ReplayEntry:
     intended_action: str = ""
     executed_action: str = ""
     normalization_notes: list[str] = field(default_factory=list)
+    # Temporary ops diagnostics for the built-in LLM agent (tick 0 only).
+    llm_decide_diagnostics: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        if data.get("llm_decide_diagnostics") is None:
+            data.pop("llm_decide_diagnostics", None)
+        return data

@@ -5,6 +5,7 @@ from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Tuple
 
 from agents.base import AgentDecision, TradingAgent
+from agents.llm_agent import LLM_AGENT_ID
 from scenarios.base import ChaosScenario
 from simulation.behavior import BehaviorTracker
 from simulation.config import SimulationConfig
@@ -42,9 +43,27 @@ class SimulationResult:
     agent_reports: List[Dict[str, Any]] = field(default_factory=list)
     failure_reports: List[Dict[str, Any]] = field(default_factory=list)
     reliability_reports: List[Dict[str, Any]] = field(default_factory=list)
+    llm_tick0_diagnostics: Dict[str, Any] | None = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        if data.get("llm_tick0_diagnostics") is None:
+            data.pop("llm_tick0_diagnostics", None)
+        return data
+
+
+def _serialize_raw_decision(raw: Any) -> Any:
+    """JSON-safe view of whatever an agent.decide() returned."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, AgentDecision):
+        return raw.to_dict()
+    to_dict = getattr(raw, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return repr(raw)
 
 
 class SimulationEngine:
@@ -107,6 +126,7 @@ class SimulationEngine:
         # Count ticks per agent where the decision boundary had to intervene
         # (normalization or a recovered decide() error). Feeds decision_integrity.
         self._integrity_events: Dict[str, int] = {agent.id: 0 for agent in self.agents}
+        llm_tick0_diagnostics: Dict[str, Any] | None = None
 
         for tick in range(self.max_ticks):
             self.market_state.advance_tick()
@@ -124,11 +144,15 @@ class SimulationEngine:
 
                 # The decision boundary: a faulty agent must never crash the
                 # run or feed malformed values into the portfolio/market.
-                decision, normalization_notes = self._decide_safely(
+                decision, normalization_notes, decide_trace = self._decide_safely(
                     agent, tick, portfolio
                 )
                 if normalization_notes:
                     self._integrity_events[agent.id] += 1
+                llm_decide_diagnostics = None
+                if agent.id == LLM_AGENT_ID and tick == 0:
+                    llm_decide_diagnostics = decide_trace
+                    llm_tick0_diagnostics = decide_trace
                 intended_action = decision.action
 
                 # A failed/liquidated agent may not increase exposure.
@@ -174,6 +198,7 @@ class SimulationEngine:
                         intended_action=intended_action,
                         executed_action=executed_action,
                         normalization_notes=normalization_notes,
+                        llm_decide_diagnostics=llm_decide_diagnostics,
                     )
                 )
 
@@ -219,6 +244,7 @@ class SimulationEngine:
             agent_reports=agent_reports,
             failure_reports=failure_reports,
             reliability_reports=reliability_reports,
+            llm_tick0_diagnostics=llm_tick0_diagnostics,
         )
 
         # Persist the full result as a sidecar so the run is reconstructable
@@ -240,12 +266,13 @@ class SimulationEngine:
 
     def _decide_safely(
         self, agent: TradingAgent, tick: int, portfolio: PortfolioState
-    ) -> Tuple[AgentDecision, List[str]]:
+    ) -> Tuple[AgentDecision, List[str], Dict[str, Any]]:
         """Invoke an agent and return a canonical decision plus boundary notes.
 
         Never raises: a faulty agent falls back to a safe hold so the run
-        continues deterministically.
+        continues deterministically. Also returns a diagnostic trace dict.
         """
+        trace: Dict[str, Any] = {}
         try:
             if self._accepts_portfolio_snapshot.get(agent.id, False):
                 raw = agent.decide(
@@ -256,14 +283,33 @@ class SimulationEngine:
             else:
                 raw = agent.decide(tick=tick, market_state=self.market_state)
         except Exception as exc:  # noqa: BLE001 - boundary must absorb any failure
+            trace["raw_decision"] = None
+            trace["exception_message"] = f"{type(exc).__name__}: {exc}"
             safe_hold = AgentDecision(
                 action="hold", size=1.0, reason="", confidence=0.5, metadata={}
             )
             note = f"agent.decide raised {type(exc).__name__}: {exc}; defaulted to safe hold"
-            return safe_hold, [note]
+            trace["normalization_notes"] = [note]
+            return safe_hold, [note], trace
+
+        trace["raw_decision"] = _serialize_raw_decision(raw)
+        llm_trace = getattr(agent, "llm_decide_diagnostics", None)
+        if isinstance(llm_trace, dict) and llm_trace.get("tick") == tick:
+            for key in (
+                "cache_hit",
+                "cache_miss",
+                "anthropic_api_called",
+                "parser_succeeded",
+            ):
+                if key in llm_trace:
+                    trace[key] = llm_trace[key]
+            internal_failure = llm_trace.get("internal_failure")
+            if internal_failure:
+                trace["exception_message"] = internal_failure
 
         result = normalize_decision(raw)
-        return result.decision, result.notes
+        trace["normalization_notes"] = list(result.notes)
+        return result.decision, result.notes, trace
 
     def _portfolio_snapshot(self, portfolio: PortfolioState) -> Mapping[str, Any]:
         """Return a read-only view of the agent's portfolio at decision time."""
