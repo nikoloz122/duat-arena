@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import socket
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -58,6 +59,19 @@ SYSTEM_PROMPT = (
 # A transport: (model, system, user, timeout) -> raw assistant text. May raise;
 # the agent absorbs any failure into a safe hold.
 LlmClient = Callable[[str, str, str, float], str]
+
+LOG_PREVIEW_CHARS = 500
+
+
+def _preview(text: Optional[str], limit: int = LOG_PREVIEW_CHARS) -> str:
+    """Return a log-safe snippet of model text (never includes secrets)."""
+    if text is None:
+        return "<none>"
+    if text == "":
+        return "<empty>"
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... ({len(text)} chars total)"
 
 
 def _load_dotenv() -> None:
@@ -283,6 +297,17 @@ def build_llm_agent(
     mode = (mode or os.getenv("DUAT_LLM_MODE") or MODE_AUTO).lower()
     cache = ResponseCache(cache_path or os.getenv("DUAT_LLM_CACHE") or DEFAULT_CACHE_PATH)
 
+    def _log_no_decision(reason: str, tick: int, *, cache_key: str, **details: Any) -> None:
+        detail_parts = " ".join(f"{key}={value!r}" for key, value in details.items())
+        logger.warning(
+            "llm no decision: %s agent=%s tick=%d cache_key=%s %s",
+            reason,
+            agent_id,
+            tick,
+            cache_key,
+            detail_parts,
+        )
+
     def decide(tick: int, market_state: MarketState, portfolio_snapshot: Any = None) -> Any:
         snapshot = dict(portfolio_snapshot) if isinstance(portfolio_snapshot, Mapping) else None
         key = _make_key(agent_id, tick, market_state, snapshot)
@@ -291,22 +316,16 @@ def build_llm_agent(
         if cached is not None:
             parsed = _parse_decision(cached)
             if parsed is None:
-                logger.warning(
-                    "llm cache hit but response is not parseable (agent=%s tick=%d key=%s)",
-                    agent_id,
+                _log_no_decision(
+                    "cache_parser_failure",
                     tick,
-                    key,
+                    cache_key=key,
+                    raw_response=_preview(cached),
                 )
             return parsed
 
         if mode == MODE_REPLAY:
-            # Demo / no-credit mode: never call the API.
-            logger.warning(
-                "llm replay mode cache miss (agent=%s tick=%d key=%s); no API call",
-                agent_id,
-                tick,
-                key,
-            )
+            _log_no_decision("replay_cache_miss", tick, cache_key=key, mode=mode)
             return None
 
         system = SYSTEM_PROMPT
@@ -314,39 +333,100 @@ def build_llm_agent(
 
         try:
             if client is not None:
+                logger.info(
+                    "llm API request started agent=%s tick=%d model=%s cache_key=%s "
+                    "timeout=%.1fs transport=injectable_client",
+                    agent_id,
+                    tick,
+                    model,
+                    key,
+                    timeout,
+                )
                 text = client(model, system, user, timeout)
             else:
                 api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
                 if not api_key:
-                    logger.warning(
-                        "llm no ANTHROPIC_API_KEY and cache miss (agent=%s tick=%d)",
-                        agent_id,
-                        tick,
-                    )
+                    _log_no_decision("missing_api_key", tick, cache_key=key, mode=mode)
                     return None
+                logger.info(
+                    "llm API request started agent=%s tick=%d model=%s cache_key=%s "
+                    "timeout=%.1fs transport=anthropic_http",
+                    agent_id,
+                    tick,
+                    model,
+                    key,
+                    timeout,
+                )
                 text = _anthropic_request(model, system, user, timeout, api_key, max_tokens)
-        except Exception as exc:  # noqa: BLE001 - any client/transport failure -> safe hold
-            logger.warning(
-                "llm request failed (agent=%s tick=%d): %s: %s",
-                agent_id,
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            _log_no_decision(
+                "http_error",
                 tick,
-                type(exc).__name__,
-                exc,
+                cache_key=key,
+                status=exc.code,
+                reason=exc.reason,
+                error_body=_preview(error_body),
+            )
+            return None
+        except (TimeoutError, socket.timeout) as exc:
+            _log_no_decision(
+                "timeout_error",
+                tick,
+                cache_key=key,
+                timeout_seconds=timeout,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+        except urllib.error.URLError as exc:
+            _log_no_decision(
+                "network_error",
+                tick,
+                cache_key=key,
+                error=f"{type(exc).__name__}: {exc.reason}",
+            )
+            return None
+        except json.JSONDecodeError as exc:
+            _log_no_decision(
+                "api_response_json_decode_error",
+                tick,
+                cache_key=key,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 - any client/transport failure -> safe hold
+            _log_no_decision(
+                "unexpected_error",
+                tick,
+                cache_key=key,
+                error=f"{type(exc).__name__}: {exc}",
             )
             return None
 
+        logger.info(
+            "llm API response received agent=%s tick=%d cache_key=%s length=%d raw=%s",
+            agent_id,
+            tick,
+            key,
+            len(text or ""),
+            _preview(text),
+        )
+
         if text is None:
-            logger.warning("llm empty response (agent=%s tick=%d)", agent_id, tick)
+            _log_no_decision("empty_response", tick, cache_key=key, raw_response="<none>")
             return None
-        # Cache the raw text (even if malformed) so replays reproduce behavior.
+        if text == "":
+            _log_no_decision("empty_response", tick, cache_key=key, raw_response="<empty>")
+            return None
+
         cache.put(key, text)
         parsed = _parse_decision(text)
         if parsed is None:
-            logger.warning(
-                "llm response not parseable (agent=%s tick=%d): %.120s",
-                agent_id,
+            _log_no_decision(
+                "parser_failure",
                 tick,
-                text,
+                cache_key=key,
+                raw_response=_preview(text),
             )
         return parsed
 
