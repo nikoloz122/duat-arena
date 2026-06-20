@@ -7,14 +7,17 @@ import unittest
 import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import backend.api.routes as routes_module
 from agents.llm_agent import (
+    DEFAULT_MODEL,
     LLM_AGENT_ID,
     MODE_REPLAY,
+    _anthropic_request,
     _parse_decision,
     build_llm_agent,
+    resolve_llm_model,
 )
 from agents.registry import EXTERNAL, build_default_registry
 from backend.api.routes import SimulationRunRequest
@@ -135,6 +138,48 @@ class LlmAgentDecisionTests(unittest.TestCase):
         self.assertTrue(any("http_error" in message for message in captured.output))
         self.assertTrue(any("reason='Not Found'" in message for message in captured.output))
         self.assertTrue(all(e["executed_action"] == "hold" for e in replay["events"]))
+
+
+class LlmModelConfigTests(unittest.TestCase):
+    def test_default_model_is_supported_haiku_snapshot(self) -> None:
+        self.assertEqual(DEFAULT_MODEL, "claude-haiku-4-5-20251001")
+
+    def test_resolve_llm_model_prefers_explicit_argument(self) -> None:
+        self.assertEqual(resolve_llm_model("claude-sonnet-4-6"), "claude-sonnet-4-6")
+
+    def test_resolve_llm_model_prefers_env(self) -> None:
+        with patch.dict(os.environ, {"DUAT_LLM_MODEL": "claude-sonnet-4-6"}, clear=False):
+            self.assertEqual(resolve_llm_model(), "claude-sonnet-4-6")
+
+    def test_resolve_llm_model_falls_back_to_default(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "DUAT_LLM_MODEL"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(resolve_llm_model(), DEFAULT_MODEL)
+
+    @patch("agents.llm_agent.urllib.request.urlopen")
+    def test_anthropic_request_sends_exact_model_id_in_body(self, mock_urlopen: MagicMock) -> None:
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {"content": [{"type": "text", "text": '{"action": "hold"}'}]}
+        ).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        with self.assertLogs("agents.llm_agent", level="INFO") as captured:
+            _anthropic_request(
+                "claude-haiku-4-5-20251001",
+                "system prompt",
+                "user prompt",
+                5.0,
+                "test-key",
+                256,
+            )
+
+        request = mock_urlopen.call_args[0][0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(body["model"], "claude-haiku-4-5-20251001")
+        self.assertTrue(
+            any("request_body.model=claude-haiku-4-5-20251001" in line for line in captured.output)
+        )
 
 
 class ParseDecisionTests(unittest.TestCase):

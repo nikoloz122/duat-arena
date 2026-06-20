@@ -40,7 +40,7 @@ LLM_AGENT_NAME = "LLM Momentum Trader"
 MODE_AUTO = "auto"
 MODE_REPLAY = "replay"
 
-DEFAULT_MODEL = "claude-3-5-haiku-latest"
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_CACHE_PATH = str(PROJECT_ROOT / "logs" / "llm_cache.json")
@@ -101,6 +101,29 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
+def resolve_llm_model(explicit: Optional[str] = None) -> str:
+    """Return the Anthropic model id used for Messages API requests."""
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    env_model = (os.getenv("DUAT_LLM_MODEL") or "").strip()
+    if env_model:
+        return env_model
+    return DEFAULT_MODEL
+
+
+def _log_startup_model_config() -> None:
+    resolved = resolve_llm_model()
+    logger.info(
+        "llm startup resolved_model=%s default=%s env_DUAT_LLM_MODEL=%r",
+        resolved,
+        DEFAULT_MODEL,
+        os.getenv("DUAT_LLM_MODEL"),
+    )
+
+
+_log_startup_model_config()
+
+
 def llm_runtime_status() -> dict[str, Any]:
     """Non-secret snapshot of LLM agent configuration for ops / health checks."""
     cache_path = Path(os.getenv("DUAT_LLM_CACHE") or DEFAULT_CACHE_PATH)
@@ -112,9 +135,12 @@ def llm_runtime_status() -> dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             cache_entries = 0
     mode = (os.getenv("DUAT_LLM_MODE") or MODE_AUTO).lower()
+    resolved_model = resolve_llm_model()
     return {
         "mode": mode,
-        "model": os.getenv("DUAT_LLM_MODEL") or DEFAULT_MODEL,
+        "model": resolved_model,
+        "default_model": DEFAULT_MODEL,
+        "model_from_env": bool((os.getenv("DUAT_LLM_MODEL") or "").strip()),
         "cache_path": str(cache_path),
         "cache_exists": cache_path.exists(),
         "cache_entries": cache_entries,
@@ -254,8 +280,16 @@ def _parse_decision(text: Optional[str]) -> Optional[dict]:
 def _anthropic_request(
     model: str, system: str, user: str, timeout: float, api_key: str, max_tokens: int
 ) -> str:
+    request_model = model.strip()
+    logger.info(
+        "llm anthropic request url=%s anthropic-version=%s request_body.model=%s max_tokens=%d",
+        ANTHROPIC_API_URL,
+        ANTHROPIC_VERSION,
+        request_model,
+        max_tokens,
+    )
     body = {
-        "model": model,
+        "model": request_model,
         "max_tokens": max_tokens,
         "system": system,
         "messages": [{"role": "user", "content": user}],
@@ -293,7 +327,7 @@ def build_llm_agent(
     list. The API is only ever called at decide-time on a cache miss in auto
     mode with a key present.
     """
-    model = model or os.getenv("DUAT_LLM_MODEL") or DEFAULT_MODEL
+    model = resolve_llm_model(model)
     mode = (mode or os.getenv("DUAT_LLM_MODE") or MODE_AUTO).lower()
     cache = ResponseCache(cache_path or os.getenv("DUAT_LLM_CACHE") or DEFAULT_CACHE_PATH)
     last_trace: dict[str, Any] = {}
