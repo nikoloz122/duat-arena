@@ -297,11 +297,11 @@ def build_llm_agent(
     mode = (mode or os.getenv("DUAT_LLM_MODE") or MODE_AUTO).lower()
     cache = ResponseCache(cache_path or os.getenv("DUAT_LLM_CACHE") or DEFAULT_CACHE_PATH)
 
-    def _log_no_decision(reason: str, tick: int, *, cache_key: str, **details: Any) -> None:
+    def _log_no_decision(reason_code: str, tick: int, *, cache_key: str, **details: Any) -> None:
         detail_parts = " ".join(f"{key}={value!r}" for key, value in details.items())
         logger.warning(
             "llm no decision: %s agent=%s tick=%d cache_key=%s %s",
-            reason,
+            reason_code,
             agent_id,
             tick,
             cache_key,

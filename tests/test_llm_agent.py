@@ -1,7 +1,9 @@
 import asyncio
+import io
 import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -42,6 +44,17 @@ def _fenced_buy_client(model, system, user, timeout):
 
 def _raising_client(model, system, user, timeout):
     raise TimeoutError("llm timed out")
+
+
+def _http_error_client(model, system, user, timeout):
+    body = io.BytesIO(b'{"type":"error","message":"model not found"}')
+    raise urllib.error.HTTPError(
+        "https://api.anthropic.com/v1/messages",
+        404,
+        "Not Found",
+        {},
+        body,
+    )
 
 
 def _cache_file(log_dir: str) -> str:
@@ -100,6 +113,17 @@ class LlmAgentDecisionTests(unittest.TestCase):
             replay = load_replay(result.replay_id, log_dir=log_dir)
 
         self.assertEqual(result.ticks, 6)
+        self.assertTrue(all(e["executed_action"] == "hold" for e in replay["events"]))
+
+    def test_http_error_logs_reason_without_typeerror(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir:
+            agent = build_llm_agent(client=_http_error_client, cache_path=_cache_file(log_dir))
+            with self.assertLogs("agents.llm_agent", level="WARNING") as captured:
+                result = _run(agent, ticks=2, log_dir=log_dir)
+            replay = load_replay(result.replay_id, log_dir=log_dir)
+
+        self.assertTrue(any("http_error" in message for message in captured.output))
+        self.assertTrue(any("reason='Not Found'" in message for message in captured.output))
         self.assertTrue(all(e["executed_action"] == "hold" for e in replay["events"]))
 
 
