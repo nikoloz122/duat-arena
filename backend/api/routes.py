@@ -5,6 +5,7 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from agents.llm_agent import llm_runtime_status
 from agents.registry import DEFAULT_REGISTRY, REMOTE, AgentRegistryError
 from agents.templates import build_default_agents
 from backend.core.config import settings
@@ -61,8 +62,20 @@ def _remote_agent_id(name: str, endpoint: str) -> str:
 
 @router.get("/health")
 async def health():
-    """Simple health check."""
-    return {"status": "ok", "service": "duat-arena"}
+    """Public health check with LLM deployment diagnostics (no secrets)."""
+    llm = llm_runtime_status()
+    mode = llm["mode"]
+    api_key_configured = llm["api_key_configured"]
+    cache_entries = llm["cache_entries"]
+    return {
+        "status": "ok",
+        "service": "duat-arena",
+        "DUAT_LLM_MODE": mode,
+        "model": llm["model"],
+        "api_key_configured": api_key_configured,
+        "cache_entries": cache_entries,
+        "llm_ready": cache_entries > 0 or (mode == "auto" and api_key_configured),
+    }
 
 
 @router.get("/scenarios")

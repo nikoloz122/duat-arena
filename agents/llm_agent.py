@@ -18,11 +18,14 @@ from a gitignored .env if present. Keys are never hardcoded or committed.
 
 import hashlib
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
+
+logger = logging.getLogger(__name__)
 
 from agents.adapters import CallableAgentAdapter
 from agents.base import TradingAgent
@@ -82,6 +85,27 @@ def _load_dotenv() -> None:
 
 
 _load_dotenv()
+
+
+def llm_runtime_status() -> dict[str, Any]:
+    """Non-secret snapshot of LLM agent configuration for ops / health checks."""
+    cache_path = Path(os.getenv("DUAT_LLM_CACHE") or DEFAULT_CACHE_PATH)
+    cache_entries = 0
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8")) or {}
+            cache_entries = len(data) if isinstance(data, dict) else 0
+        except (OSError, json.JSONDecodeError):
+            cache_entries = 0
+    mode = (os.getenv("DUAT_LLM_MODE") or MODE_AUTO).lower()
+    return {
+        "mode": mode,
+        "model": os.getenv("DUAT_LLM_MODEL") or DEFAULT_MODEL,
+        "cache_path": str(cache_path),
+        "cache_exists": cache_path.exists(),
+        "cache_entries": cache_entries,
+        "api_key_configured": bool((os.getenv("ANTHROPIC_API_KEY") or "").strip()),
+    }
 
 
 class ResponseCache:
@@ -265,10 +289,24 @@ def build_llm_agent(
 
         cached = cache.get(key)
         if cached is not None:
-            return _parse_decision(cached)
+            parsed = _parse_decision(cached)
+            if parsed is None:
+                logger.warning(
+                    "llm cache hit but response is not parseable (agent=%s tick=%d key=%s)",
+                    agent_id,
+                    tick,
+                    key,
+                )
+            return parsed
 
         if mode == MODE_REPLAY:
             # Demo / no-credit mode: never call the API.
+            logger.warning(
+                "llm replay mode cache miss (agent=%s tick=%d key=%s); no API call",
+                agent_id,
+                tick,
+                key,
+            )
             return None
 
         system = SYSTEM_PROMPT
@@ -278,18 +316,38 @@ def build_llm_agent(
             if client is not None:
                 text = client(model, system, user, timeout)
             else:
-                api_key = os.getenv("ANTHROPIC_API_KEY")
+                api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
                 if not api_key:
-                    # No key and no cache hit: degrade to a safe hold.
+                    logger.warning(
+                        "llm no ANTHROPIC_API_KEY and cache miss (agent=%s tick=%d)",
+                        agent_id,
+                        tick,
+                    )
                     return None
                 text = _anthropic_request(model, system, user, timeout, api_key, max_tokens)
-        except Exception:  # noqa: BLE001 - any client/transport failure -> safe hold
+        except Exception as exc:  # noqa: BLE001 - any client/transport failure -> safe hold
+            logger.warning(
+                "llm request failed (agent=%s tick=%d): %s: %s",
+                agent_id,
+                tick,
+                type(exc).__name__,
+                exc,
+            )
             return None
 
         if text is None:
+            logger.warning("llm empty response (agent=%s tick=%d)", agent_id, tick)
             return None
         # Cache the raw text (even if malformed) so replays reproduce behavior.
         cache.put(key, text)
-        return _parse_decision(text)
+        parsed = _parse_decision(text)
+        if parsed is None:
+            logger.warning(
+                "llm response not parseable (agent=%s tick=%d): %.120s",
+                agent_id,
+                tick,
+                text,
+            )
+        return parsed
 
     return CallableAgentAdapter(agent_id, decide, name=name, risk_profile="llm")
