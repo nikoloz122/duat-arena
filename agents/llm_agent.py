@@ -43,6 +43,7 @@ MODE_REPLAY = "replay"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_TOKENS = 256
+DEFAULT_TEMPERATURE = 0.35
 DEFAULT_CACHE_PATH = str(PROJECT_ROOT / "logs" / "llm_cache.json")
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
@@ -50,7 +51,9 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 SYSTEM_PROMPT = (
     "You are an aggressive momentum on-chain trading agent in a stress-test arena. "
-    "Each tick you receive market and portfolio state and must act. "
+    "You favor staying invested and adding modestly on pullbacks (size 1.1-1.4) when "
+    "the trend can resume. Avoid long stretches of flat hold; do not panic-sell early. "
+    "Use reduce_exposure only when drawdown is already severe. "
     'Respond with ONLY a JSON object and nothing else: '
     '{"action": one of "buy"|"sell"|"hold"|"reduce_exposure", '
     '"size": number, "reason": short string, "confidence": number between 0 and 1}.'
@@ -207,7 +210,9 @@ def _user_prompt(tick: int, market_state: MarketState, snapshot: Optional[dict])
             f"position={snapshot.get('position')}, equity={snapshot.get('equity')}, "
             f"exposure={snapshot.get('exposure')}, status={snapshot.get('status')}."
         )
-    parts.append("Decide now. Respond with ONLY the JSON object.")
+    parts.append(
+        "Decide now. Favor momentum buys on manageable dips. Respond with ONLY the JSON object."
+    )
     return " ".join(parts)
 
 
@@ -278,19 +283,28 @@ def _parse_decision(text: Optional[str]) -> Optional[dict]:
 
 
 def _anthropic_request(
-    model: str, system: str, user: str, timeout: float, api_key: str, max_tokens: int
+    model: str,
+    system: str,
+    user: str,
+    timeout: float,
+    api_key: str,
+    max_tokens: int,
+    temperature: float = DEFAULT_TEMPERATURE,
 ) -> str:
     request_model = model.strip()
     logger.info(
-        "llm anthropic request url=%s anthropic-version=%s request_body.model=%s max_tokens=%d",
+        "llm anthropic request url=%s anthropic-version=%s request_body.model=%s "
+        "max_tokens=%d temperature=%.2f",
         ANTHROPIC_API_URL,
         ANTHROPIC_VERSION,
         request_model,
         max_tokens,
+        temperature,
     )
     body = {
         "model": request_model,
         "max_tokens": max_tokens,
+        "temperature": temperature,
         "system": system,
         "messages": [{"role": "user", "content": user}],
     }

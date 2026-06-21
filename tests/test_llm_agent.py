@@ -177,6 +177,7 @@ class LlmModelConfigTests(unittest.TestCase):
         request = mock_urlopen.call_args[0][0]
         body = json.loads(request.data.decode("utf-8"))
         self.assertEqual(body["model"], "claude-haiku-4-5-20251001")
+        self.assertEqual(body["temperature"], 0.35)
         self.assertTrue(
             any("request_body.model=claude-haiku-4-5-20251001" in line for line in captured.output)
         )
