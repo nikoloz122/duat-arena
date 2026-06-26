@@ -87,3 +87,20 @@ export function agentLabel(id: string, name?: string): string {
     .join(" ");
   return label.endsWith("Agent") || label.endsWith("Bot") ? label : `${label} Agent`;
 }
+
+export function connectionStatusLabel(status?: string): string {
+  if (status === "online") return "Online";
+  if (status === "slow") return "Slow";
+  return "Offline";
+}
+
+export function connectionStatusEmoji(status?: string): string {
+  if (status === "online") return "🟢";
+  if (status === "slow") return "🟡";
+  return "🔴";
+}
+
+export function isSelectableAgent(agent: { kind?: string; enabled?: boolean }): boolean {
+  if (agent.kind === "remote" && agent.enabled === false) return false;
+  return true;
+}

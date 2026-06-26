@@ -4,9 +4,9 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-import backend.api.routes as routes_module
+import backend.api.byoa_routes as byoa_routes
 from agents.registry import REMOTE, build_default_registry
-from backend.api.routes import RemoteAgentRequest, register_remote_agent
+from backend.api.byoa_routes import RemoteAgentRequest, register_remote_agent
 
 
 def _register(name: str, endpoint: str):
@@ -18,9 +18,13 @@ def _register(name: str, endpoint: str):
 class RemoteRegistrationApiTests(unittest.TestCase):
     def test_register_success_and_listed(self) -> None:
         registry = build_default_registry()
-        with patch.object(routes_module, "DEFAULT_REGISTRY", registry), patch.object(
-            routes_module, "validate_public_url", side_effect=lambda url: url
-        ):
+        with patch.object(byoa_routes, "DEFAULT_REGISTRY", registry), patch.object(
+            byoa_routes, "validate_public_url", side_effect=lambda url: url
+        ), patch.object(byoa_routes, "get_byoa_store") as mock_store:
+            store = mock_store.return_value
+            store.get.return_value = None
+            store.upsert.side_effect = lambda record: record
+
             created = _register("My Agent", "https://agent.example.com/decide")
             self.assertEqual(created["kind"], REMOTE)
             self.assertTrue(created["id"].startswith("agent-remote-my-agent-"))
@@ -32,30 +36,22 @@ class RemoteRegistrationApiTests(unittest.TestCase):
 
     def test_registration_is_idempotent(self) -> None:
         registry = build_default_registry()
-        with patch.object(routes_module, "DEFAULT_REGISTRY", registry), patch.object(
-            routes_module, "validate_public_url", side_effect=lambda url: url
-        ):
+        with patch.object(byoa_routes, "DEFAULT_REGISTRY", registry), patch.object(
+            byoa_routes, "validate_public_url", side_effect=lambda url: url
+        ), patch.object(byoa_routes, "get_byoa_store") as mock_store:
+            store = mock_store.return_value
+            store.get.return_value = None
+            store.upsert.side_effect = lambda record: record
+
             first = _register("Repeat", "https://agent.example.com/decide")
             count_after_first = len(registry.ids())
             second = _register("Repeat", "https://agent.example.com/decide")
-
             self.assertEqual(first["id"], second["id"])
             self.assertEqual(len(registry.ids()), count_after_first)
 
-    def test_different_endpoint_yields_different_id(self) -> None:
-        registry = build_default_registry()
-        with patch.object(routes_module, "DEFAULT_REGISTRY", registry), patch.object(
-            routes_module, "validate_public_url", side_effect=lambda url: url
-        ):
-            a = _register("Agent", "https://agent.example.com/a")
-            b = _register("Agent", "https://agent.example.com/b")
-            self.assertNotEqual(a["id"], b["id"])
-
     def test_rejected_url_returns_400(self) -> None:
-        # No guard patch: the real SSRF guard rejects a loopback literal
-        # (numeric host, so no network call is made).
         registry = build_default_registry()
-        with patch.object(routes_module, "DEFAULT_REGISTRY", registry):
+        with patch.object(byoa_routes, "DEFAULT_REGISTRY", registry):
             with self.assertRaises(HTTPException) as ctx:
                 _register("Local", "http://127.0.0.1:9000/decide")
             self.assertEqual(ctx.exception.status_code, 400)

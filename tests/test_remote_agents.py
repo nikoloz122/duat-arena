@@ -23,24 +23,24 @@ from simulation.replay_parser import load_replay
 ENDPOINT = "http://localhost:9/decide"
 
 
-def _valid_buy_post(url, payload, timeout):
+def _valid_buy_post(url, payload, timeout, headers):
     return {"action": "buy", "size": 1.0, "reason": "remote buy", "confidence": 0.6}
 
 
-def _malformed_body_post(url, payload, timeout):
+def _malformed_body_post(url, payload, timeout, headers):
     # Valid JSON, malformed decision: the engine's normalizer must coerce it.
     return {"action": "explode", "size": "big"}
 
 
-def _timeout_post(url, payload, timeout):
+def _timeout_post(url, payload, timeout, headers):
     raise TimeoutError("remote timed out")
 
 
-def _http_500_post(url, payload, timeout):
+def _http_500_post(url, payload, timeout, headers):
     raise urllib.error.HTTPError(url, 503, "Service Unavailable", {}, None)
 
 
-def _connection_error_post(url, payload, timeout):
+def _connection_error_post(url, payload, timeout, headers):
     raise urllib.error.URLError("connection refused")
 
 
@@ -148,10 +148,11 @@ class RemoteAdapterUnitTests(unittest.TestCase):
     def test_payload_includes_context(self) -> None:
         captured = {}
 
-        def capture_post(url, payload, timeout):
+        def capture_post(url, payload, timeout, headers):
             captured["url"] = url
             captured["payload"] = payload
-            return {"action": "hold"}
+            captured["headers"] = headers
+            return {"action": "hold", "size": 1.0, "reason": "ok", "confidence": 0.5}
 
         agent = RemoteHttpAgentAdapter("agent-remote", ENDPOINT, post_fn=capture_post)
         agent.decide(
@@ -162,8 +163,8 @@ class RemoteAdapterUnitTests(unittest.TestCase):
 
         self.assertEqual(captured["url"], ENDPOINT)
         self.assertEqual(captured["payload"]["tick"], 3)
-        self.assertIn("current_price", captured["payload"]["market_state"])
-        self.assertEqual(captured["payload"]["portfolio_snapshot"]["cash"], 10.0)
+        self.assertIn("current_price", captured["payload"]["market"])
+        self.assertEqual(captured["payload"]["portfolio"]["cash"], 10.0)
 
 
 class RemoteAgentRegistryTests(unittest.TestCase):

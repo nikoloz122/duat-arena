@@ -8,9 +8,9 @@ DUAT Arena is a local-first reliability-testing platform for autonomous financia
 - `simulation/` owns the deterministic engine and its supporting pieces: market state, the decision boundary, portfolio accounting, behavior tracking, failure analysis, reliability scoring, integrity categorization (`integrity.py`), deterministic remediation guidance (`remediation.py`), the run manifest, and replay read/write.
 - `agents/` contains the trading agent contract, preset templates, the agent registry, the callable adapter for in-process external agents, the remote HTTP adapter for out-of-process agents, and the LLM agent with response cache.
 - `scenarios/` contains chaos scenario implementations and a single scenario registry.
-- `frontend/` is the **primary demo UI** (Next.js). It consumes the FastAPI backend via `frontend/lib/api.ts` and renders scenario/agent selection, simulation runs, replay timeline, integrity violations, reliability scorecards, recommended fixes, and bring-your-own-agent registration.
+- `frontend/` is the **primary demo UI** (Next.js). Pages: **Arena** (`/`), **Connect Your Agent** (`/connect`), **API Documentation** (`/docs`). The UI consumes FastAPI via `frontend/lib/api.ts` and renders scenario/agent selection (sidebar), simulation runs, replay timeline, integrity violations, reliability scorecards, recommended fixes, and BYOA registration.
 - `dashboard/` is the **secondary UI** (Streamlit). It adds run comparison and is useful for side-by-side reliability review across past runs.
-- `logs/` stores local replay JSONL files plus `.manifest.json`, `.summary.json`, and `llm_cache.json` sidecars.
+- `logs/` stores local replay JSONL files plus `.manifest.json`, `.summary.json`, `llm_cache.json`, and `byoa_agents.json` (registered remote agents).
 
 ## End-to-End Flow (UI → Grade)
 
@@ -37,20 +37,94 @@ Browser (localhost:3000)
 2. The engine seeds each agent's portfolio and advances `MarketState` once per tick.
 3. The selected scenario can mutate market state for that tick.
 4. Each agent's `decide()` output passes through the decision boundary: the `DecisionNormalizer` validates and canonicalizes it, and a raising agent falls back to a safe hold. The original intent and any normalization notes are recorded.
-5. The engine applies the executed action to the portfolio and the market, records a `ReplayEntry`, and updates behavior counters.
-6. After the loop, the engine builds per-agent reports, runs `FailureAnalysis`, and computes a `ReliabilityScore` per agent.
-7. `ReplayRecorder` writes the JSONL replay plus a manifest sidecar (scenario, config, agent identities) and a run-summary sidecar (the full result).
-8. Read endpoints serve the timeline, integrity categorization, scorecards, run listing, and comparison.
+5. Agents run in **request order** within each tick; each executed action mutates the shared `MarketState` before the next agent decides. A multi-agent run on the same scenario is therefore **not comparable** to a solo-agent run with the same tick count.
+6. The engine applies the executed action to the portfolio and the market, records a `ReplayEntry`, and updates behavior counters.
+7. After the loop, the engine builds per-agent reports, runs `FailureAnalysis`, and computes a `ReliabilityScore` per agent.
+8. `ReplayRecorder` writes the JSONL replay plus a manifest sidecar (scenario, config, agent identities) and a run-summary sidecar (the full result).
+9. Read endpoints serve the timeline, integrity categorization, scorecards, run listing, and comparison.
 
-## Bring Your Own Agent
+## Bring Your Own Agent (BYOA)
 
-Users can register a remote HTTP agent without modifying server code:
+DUAT connects **existing** remote agents — it does not build, host, or deploy them. A developer registers an HTTP `POST /decide` endpoint; DUAT validates compatibility, stress-tests under chaos scenarios, and grades reliability.
 
-1. User hosts an endpoint that accepts `POST { tick, market_state, portfolio_snapshot }` and returns `{ action, size, reason, confidence }`.
-2. User pastes the URL into the Next.js "Bring your own agent" form.
-3. `POST /api/agents/remote` validates the URL via `backend/core/url_guard.py` (SSRF guard: rejects loopback, private, link-local, and metadata addresses), generates a server-side `agent_id`, and registers via `AgentRegistry.register_remote`.
-4. The new agent appears in `GET /api/agents` and can be selected for a run.
-5. Registration is in-memory per process; no persistence.
+### UI
+
+| Page | Path | Purpose |
+|------|------|---------|
+| Connect Your Agent | `/connect` | Name, endpoint URL, optional auth, Test Connection, save/edit/delete/enable/disable |
+| API Documentation | `/docs` | Contract, OpenAPI spec, curl/Python/FastAPI/Express examples |
+| Arena | `/` | Sidebar lists built-in + connected agents (Online / Slow / Offline); select and run simulation |
+
+### Management API (`backend/api/byoa_routes.py`)
+
+- `POST /api/agents/remote` — register (persisted to `logs/byoa_agents.json`)
+- `POST /api/agents/remote/test` — probe endpoint (HTTP status, JSON contract, latency)
+- `PUT/DELETE /api/agents/remote/{id}` — edit / remove
+- `POST /api/agents/remote/{id}/enable|disable|retest`
+- `GET /api/byoa/docs` — integration guide for developers
+
+When `DUAT_ARENA_API_KEY` is set, management routes require header `X-DUAT-Api-Key`. `GET /api/agents` (list for Arena UI) stays open.
+
+### API contract
+
+**Request** (each simulation tick):
+
+```json
+{ "tick": 0, "market": { ... }, "portfolio": { ... } }
+```
+
+**Response:**
+
+```json
+{ "action": "buy|sell|hold|reduce_exposure", "confidence": 0.0-1.0, "size": 0.0-1.0, "reason": "..." }
+```
+
+Test Connection **rejects** incompatible responses. During a run, malformed runtime responses are coerced to a safe **hold** by the decision boundary (simulation never crashes).
+
+### BYOA runtime flow (isolated from engine core)
+
+```
+User's POST /decide endpoint
+  → RemoteHttpAgentAdapter.decide()     (agents/remote_adapter.py)
+    → returns raw JSON or None on transport failure
+  → SimulationEngine._decide_safely()   (simulation/engine.py)
+    → catches exceptions → safe hold
+  → DecisionNormalizer                  (simulation/decision_normalizer.py)
+    → canonical AgentDecision or safe hold + notes
+  → portfolio / market update → ReplayEntry
+```
+
+No BYOA imports exist in `simulation/engine.py`. Registry sync loads persisted agents at startup (`agents/registry.py` + `agents/byoa_store.py`).
+
+### Persistence
+
+Registered agents: `logs/byoa_agents.json` (local JSON, replaceable store). Secrets stored encrypted (`agents/byoa_crypto.py`); `DUAT_BYOA_KEY` required when `ENVIRONMENT=production`.
+
+### Security
+
+| Control | Module |
+|---------|--------|
+| SSRF / URL validation | `backend/core/url_guard.py` |
+| Secret encryption | `agents/byoa_crypto.py` |
+| Production startup checks | `backend/core/startup.py` |
+| Management API key | `backend/core/security.py` |
+| Test Connection rate limit | `backend/core/rate_limit.py` |
+
+**Localhost and private IPs are intentionally blocked** for user-supplied agent URLs. The server performs outbound requests to registered endpoints; allowing loopback would be a server-side request forgery (SSRF) risk. Agents running on a developer machine must be exposed via a **public HTTPS URL** (e.g. ngrok, Cloudflare Tunnel) for Test Connection and simulation. This applies in all environments where the SSRF guard is active.
+
+### Production deployment notes
+
+Set before starting the backend (`backend/main.py` calls `validate_production_config()` on import):
+
+```bash
+ENVIRONMENT=production
+DUAT_BYOA_KEY=<long random secret>
+DUAT_ARENA_API_KEY=<long random secret>
+```
+
+For a private Next.js UI that calls BYOA management routes, also set `NEXT_PUBLIC_DUAT_ARENA_API_KEY` to the same value as `DUAT_ARENA_API_KEY`. Do not expose that key on an untrusted public browser UI without a backend-for-frontend.
+
+Optional tuning: `DUAT_BYOA_TEST_RATE_LIMIT`, `DUAT_BYOA_TEST_RATE_WINDOW_SECONDS`, `REPLAY_LOG_DIR`.
 
 Server-side `registry.register_remote(...)` remains available for tests and local development.
 
@@ -90,7 +164,9 @@ All agents — preset, in-process external, remote, or LLM — run through the s
 - Simulation orchestration: `simulation/engine.py`
 - Replay write path: `simulation/replay.py`
 - Replay read path and run listing/comparison helpers: `simulation/replay_parser.py`
+- BYOA management and store: `backend/api/byoa_routes.py`, `agents/byoa_store.py`, `agents/byoa_contract.py`, `agents/byoa_http.py`, `agents/byoa_crypto.py`
 - SSRF guard: `backend/core/url_guard.py`
+- Production config: `backend/core/config.py`, `backend/core/startup.py`, `backend/core/security.py`, `backend/core/rate_limit.py`
 - Scenario implementations and registry: `scenarios/`
 - HTTP API surface: `backend/api/routes.py`
 - Next.js API client: `frontend/lib/api.ts`
@@ -105,10 +181,9 @@ All agents — preset, in-process external, remote, or LLM — run through the s
 
 ## MVP Boundaries
 
-- No database (local JSONL + sidecars only).
+- No database (local JSONL + sidecars + `byoa_agents.json` only).
 - No broker or exchange integrations.
 - No distributed queues or workers.
-- No auth.
-- Remote HTTP agents are supported with SSRF guard on user-supplied URLs, but with no sandboxing/process isolation, no outbound auth to the agent endpoint, and no retries (single attempt with a timeout).
-- Remote agent registration is in-memory per process (no persistence, no per-session isolation).
+- No multi-tenant auth or billing.
+- Remote HTTP agents: SSRF guard on user URLs, encrypted secrets, optional API key on BYOA management routes, single HTTP attempt per tick with timeout, no sandboxing of remote code.
 - No production observability stack.

@@ -3,6 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.routes import router
 from backend.core.config import settings
+from backend.core.startup import validate_production_config
+
+validate_production_config()
 
 
 app = FastAPI(

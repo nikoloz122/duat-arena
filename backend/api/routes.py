@@ -1,15 +1,13 @@
-import hashlib
-import re
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from agents.llm_agent import llm_runtime_status
-from agents.registry import DEFAULT_REGISTRY, REMOTE, AgentRegistryError
+from agents.registry import DEFAULT_REGISTRY, AgentRegistryError
 from agents.templates import build_default_agents
+from backend.api.byoa_routes import byoa_router
 from backend.core.config import settings
-from backend.core.url_guard import validate_public_url
 from scenarios.registry import get_scenario, list_scenarios as registry_list_scenarios
 from simulation.engine import SimulationEngine
 from simulation.integrity import categorize_events
@@ -23,6 +21,7 @@ from simulation.replay_parser import (
 from simulation.scorecard import build_scorecards
 
 router = APIRouter(tags=["Simulation"])
+router.include_router(byoa_router)
 
 
 class SimulationRunRequest(BaseModel):
@@ -39,25 +38,6 @@ class SimulationRunRequest(BaseModel):
 class ReplayCompareRequest(BaseModel):
     """Request model for comparing reliability across runs."""
     replay_ids: List[str] = Field(..., min_length=2, description="Replay ids to compare")
-
-
-class RemoteAgentRequest(BaseModel):
-    """Request to register a user's own agent reachable over HTTP."""
-    name: str = Field(..., min_length=1, max_length=80, description="Display name")
-    endpoint: str = Field(..., min_length=1, description="HTTP(S) decision endpoint URL")
-    timeout: float = Field(default=5.0, gt=0, le=30, description="Per-call timeout (s)")
-
-
-def _remote_agent_id(name: str, endpoint: str) -> str:
-    """Derive a stable, server-controlled id from name + endpoint.
-
-    The endpoint is hashed so the same name+endpoint always maps to the same id
-    (enabling idempotent registration), while the client can never choose or
-    spoof an id.
-    """
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "agent"
-    digest = hashlib.sha1(endpoint.encode("utf-8")).hexdigest()[:8]
-    return f"agent-remote-{slug}-{digest}"
 
 
 @router.get("/health")
@@ -88,35 +68,6 @@ async def list_scenarios():
 async def list_agents():
     """Return registered agents (presets and any registered external agents)."""
     return DEFAULT_REGISTRY.list_agents()
-
-
-@router.post("/agents/remote")
-async def register_remote_agent(request: RemoteAgentRequest):
-    """Register a user-provided HTTP agent so it can be selected for a run.
-
-    The endpoint is SSRF-guarded before registration. The id is derived
-    server-side from name+endpoint, so re-registering the same agent is
-    idempotent rather than an error. Registration is in-memory/per-process.
-    """
-    try:
-        safe_url = validate_public_url(request.endpoint)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    agent_id = _remote_agent_id(request.name, safe_url)
-
-    # Same name+endpoint -> same id: return it idempotently.
-    if DEFAULT_REGISTRY.is_registered(agent_id):
-        return {"id": agent_id, "name": request.name, "kind": REMOTE}
-
-    try:
-        DEFAULT_REGISTRY.register_remote(
-            agent_id, safe_url, name=request.name, timeout=request.timeout
-        )
-    except AgentRegistryError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return {"id": agent_id, "name": request.name, "kind": REMOTE}
 
 
 @router.post("/simulations/run")

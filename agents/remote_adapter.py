@@ -14,40 +14,24 @@ hold and records a boundary note, so a flaky or hostile endpoint is penalized on
 continues deterministically.
 """
 
-import json
 import urllib.error
-import urllib.request
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from agents.base import TradingAgent
+from agents.byoa_contract import build_decide_payload
+from agents.byoa_http import AUTH_NONE, PostFn, build_auth_headers, default_post
 from simulation.market import MarketState
 
 REMOTE = "remote"
 
 DEFAULT_TIMEOUT_SECONDS = 5.0
 
-# A transport: given (url, json_payload, timeout) it returns the parsed JSON
-# response object. It may raise on any failure; the adapter absorbs that.
-PostFn = Callable[[str, dict, float], Any]
 
-
-def _default_post(url: str, payload: dict, timeout: float) -> Any:
-    """POST ``payload`` as JSON and return the parsed JSON response.
-
-    Raises on non-2xx status, connection/timeout errors, or non-JSON bodies;
-    the adapter catches all of these and falls back to a safe hold.
-    """
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    # urlopen raises HTTPError for non-2xx and URLError/TimeoutError otherwise.
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read().decode("utf-8")
-    return json.loads(body)
+def _default_post(url: str, payload: dict, timeout: float, headers: Mapping[str, str]) -> Any:
+    status, body = default_post(url, payload, timeout, headers)
+    if status < 200 or status >= 300:
+        raise urllib.error.HTTPError(url, status, "Non-2xx response", {}, None)
+    return body
 
 
 class RemoteHttpAgentAdapter(TradingAgent):
@@ -60,6 +44,8 @@ class RemoteHttpAgentAdapter(TradingAgent):
         name: Optional[str] = None,
         risk_profile: str = "remote",
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        auth_type: str = AUTH_NONE,
+        auth_secret: Optional[str] = None,
         post_fn: Optional[PostFn] = None,
     ) -> None:
         super().__init__(
@@ -72,20 +58,23 @@ class RemoteHttpAgentAdapter(TradingAgent):
             raise ValueError("endpoint must be a non-empty URL")
         self.endpoint = endpoint
         self.timeout = timeout
+        self.auth_type = auth_type
+        self.auth_secret = auth_secret or ""
         # Injectable transport keeps the adapter testable without real network.
         self._post_fn: PostFn = post_fn if post_fn is not None else _default_post
 
     def decide(
         self, tick: int, market_state: MarketState, portfolio_snapshot: Any = None
     ) -> Any:
-        payload = {
-            "tick": tick,
-            "market_state": market_state.to_dict(),
-            "portfolio_snapshot": self._snapshot_to_jsonable(portfolio_snapshot),
-        }
+        payload = build_decide_payload(
+            tick=tick,
+            market=market_state.to_dict(),
+            portfolio=self._snapshot_to_jsonable(portfolio_snapshot),
+        )
+        headers = build_auth_headers(self.auth_type, self.auth_secret)
         try:
-            # Single attempt for MVP: no retries, no streaming, no auth.
-            return self._post_fn(self.endpoint, payload, self.timeout)
+            # Single attempt for MVP: no retries, no streaming.
+            return self._post_fn(self.endpoint, payload, self.timeout, headers)
         except Exception:  # noqa: BLE001 - any transport failure becomes a safe hold
             # Returning None (not raising) hands control to the engine's
             # normalizer, which records a boundary note and a safe hold.
